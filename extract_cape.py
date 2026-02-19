@@ -3,193 +3,380 @@ import time
 import requests
 import numpy as np
 import json
+import glob
+import sys
 
-# --- CẤU HÌNH ĐÃ XÁC THỰC ---
-# Dựa trên kết quả curl của bạn: Port 8000, Server 10.144.5.64
+# --- CẤU HÌNH CAPEv2 (Đã chuẩn theo script của bạn) ---
 CAPE_HOST = "http://10.144.5.64:8000"
 API_TOKEN = "5f42b8083e6a6e95bd32ff2037ae323252dcb8ff"
-
-# Header xác thực
 HEADERS = {"Authorization": f"Token {API_TOKEN}"}
 
-# Thư mục dữ liệu
-ROOT_DIR = "Adv"
-OUTPUT_FILE = "Adv.npz"
+# Cấu hình thư mục
+ROOT_DIR = "Test"  # Thư mục chứa mẫu malware
+FINAL_OUTPUT_FILE = "Test.npz"
+
+# Cấu hình Workspace (Nơi chứa file tạm và log)
+WORKSPACE_DIR = "progress_Test"
+PROGRESS_LOG = os.path.join(WORKSPACE_DIR, "processed_log.json")
+BATCH_SIZE = 10
+
+# ==============================================================================
+# 1. CÁC HÀM HỖ TRỢ BATCH & LOGGING (GIỐNG CUCKOO)
+# ==============================================================================
+
+
+def ensure_workspace():
+    if not os.path.exists(WORKSPACE_DIR):
+        os.makedirs(WORKSPACE_DIR)
+
+
+def load_processed_set():
+    """Load danh sách file đã làm xong để bỏ qua (Resume)"""
+    if os.path.exists(PROGRESS_LOG):
+        try:
+            with open(PROGRESS_LOG, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except:
+            return set()
+    return set()
+
+
+def save_batch_npz(data_dict):
+    """Lưu batch ra .npz VÀ cập nhật ngay file JSON log."""
+    if not data_dict["name"]:
+        return
+
+    count = len(data_dict["name"])
+    timestamp = int(time.time())
+
+    filename = f"batch_{timestamp}_{count}_samples.npz"
+    filepath = os.path.join(WORKSPACE_DIR, filename)
+
+    print(f"\n [SAVE] Đang lưu {count} file vào đĩa -> {filename}")
+
+    try:
+        np.savez_compressed(
+            filepath,
+            name=np.array(data_dict["name"]),
+            label=np.array(data_dict["label"]),
+            api=np.array(data_dict["api"], dtype=object),
+            pe_imports=np.array(data_dict["pe_imports"], dtype=object),
+            pe_sections=np.array(data_dict["pe_sections"], dtype=object),
+        )
+    except Exception as e:
+        print(f" [!] Lỗi KHI LƯU FILE NPZ: {e}")
+        return
+
+    # Cập nhật JSON Log
+    current_log = []
+    if os.path.exists(PROGRESS_LOG):
+        try:
+            with open(PROGRESS_LOG, "r", encoding="utf-8") as f:
+                current_log = json.load(f)
+        except:
+            pass
+
+    current_log.extend(data_dict["name"])
+
+    try:
+        with open(PROGRESS_LOG, "w", encoding="utf-8") as f:
+            json.dump(current_log, f, indent=2)
+        print(" [LOG] Đã cập nhật file processed_log.json.")
+    except Exception as e:
+        print(f" [!] Lỗi cập nhật JSON Log: {e}")
+
+
+def merge_all_npz():
+    """Gộp tất cả file con thành file lớn cuối cùng"""
+    print(f"\n--- GIAI ĐOẠN CUỐI: GỘP TOÀN BỘ FILE ---")
+    npz_files = glob.glob(os.path.join(WORKSPACE_DIR, "*.npz"))
+    if not npz_files:
+        print(" [!] Không có file nào để gộp.")
+        return
+
+    all_data = {"name": [], "label": [], "api": [], "pe_imports": [], "pe_sections": []}
+
+    print(f" -> Tìm thấy {len(npz_files)} file batch. Đang gộp...")
+    for f in npz_files:
+        try:
+            d = np.load(f, allow_pickle=True)
+            all_data["name"].append(d["name"])
+            all_data["label"].append(d["label"])
+            all_data["api"].append(d["api"])
+            all_data["pe_imports"].append(d["pe_imports"])
+            all_data["pe_sections"].append(d["pe_sections"])
+        except Exception as e:
+            print(f" [!] Lỗi đọc file {f}: {e}")
+
+    print(f" -> Đang nối dữ liệu và lưu vào {FINAL_OUTPUT_FILE}...")
+    try:
+        np.savez_compressed(
+            FINAL_OUTPUT_FILE,
+            name=np.concatenate(all_data["name"]),
+            label=np.concatenate(all_data["label"]),
+            api=np.concatenate(all_data["api"]),
+            pe_imports=np.concatenate(all_data["pe_imports"]),
+            pe_sections=np.concatenate(all_data["pe_sections"]),
+        )
+        print(" [DONE] Hoàn tất!")
+    except Exception as e:
+        print(f" [!] Lỗi khi gộp file: {e}")
+
+
+# ==============================================================================
+# 2. CÁC HÀM TƯƠNG TÁC CAPE (Logic của bạn + Auto Delete)
+# ==============================================================================
 
 
 def submit_to_cape(file_path):
-    """
-    Gửi file lên CAPEv2 (Endpoint: /apiv2/tasks/create/file/)
-    """
-    # URL này chắc chắn đúng vì HTML của bạn có link /apiv2/
     url = f"{CAPE_HOST}/apiv2/tasks/create/file/"
 
-    # Cấu hình: Timeout 300s (5 phút)
-    data_params = {"timeout": 300, "platform": "windows", "enforce_timeout": False}
+    # --- TURBO MODE (TỪ SCRIPT CỦA BẠN) ---
+    options_str = "sniffer=0,procmemdump=0,dumpprocess=0,dump_r0=0,curtain=0,sysmon=0"
+    data_params = {
+        "timeout": 300,
+        "platform": "windows",
+        "enforce_timeout": False,
+        "options": options_str,
+    }
 
-    try:
-        with open(file_path, "rb") as f:
-            files = {"file": (os.path.basename(file_path), f)}
+    while True:  # Retry Loop
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f)}
+                r = requests.post(
+                    url, headers=HEADERS, files=files, data=data_params, timeout=30
+                )
 
-            print(f" -> Đang gửi file lên {url} ...")
-            r = requests.post(url, headers=HEADERS, files=files, data=data_params)
-
-            # Nếu server trả về 200 OK
-            if r.status_code == 200:
-                resp = r.json()
-                # CAPE return: {"data": {"task_ids": [123]}, "error": false}
-                task_ids = resp.get("data", {}).get("task_ids", [])
-                if task_ids:
-                    print(f" [OK] Submit thành công. Task ID: {task_ids[0]}")
-                    return task_ids[0]
-
-            print(f" [!] Lỗi submit: {r.text}")
+                if r.status_code == 200:
+                    task_ids = r.json().get("data", {}).get("task_ids", [])
+                    if task_ids:
+                        return task_ids[0]
+                elif r.status_code >= 500:
+                    print(" [!] Server quá tải (500). Đợi 15s...", end="\r")
+                    time.sleep(15)
+                    continue
+                else:
+                    print(f" [!] Lỗi Submit (HTTP {r.status_code}): {r.text}")
+                    return None
+        except requests.exceptions.RequestException:
+            print(" [!] Mất kết nối. Đợi 10s...", end="\r")
+            time.sleep(10)
+        except Exception as e:
+            print(f" [!] Lỗi lạ: {e}")
             return None
-
-    except Exception as e:
-        print(f" [!] Lỗi kết nối: {e}")
-        return None
 
 
 def wait_for_report(task_id):
     """
-    Đợi phân tích xong và tải báo cáo JSON
+    Sử dụng logic check lỗi 'error: true' của bạn + Retry
     """
     status_url = f"{CAPE_HOST}/apiv2/tasks/view/{task_id}/"
     report_url = f"{CAPE_HOST}/apiv2/tasks/get/report/{task_id}/json/"
 
-    print(f" [*] Đang đợi Task {task_id}...", end="", flush=True)
+    print(f"[*] Đợi Task {task_id}...", end="", flush=True)
 
-    # Vòng lặp đợi (Tối đa 10 phút)
-    for i in range(60):
+    # Đợi tối đa 40 phút
+    for i in range(240):
         try:
-            r = requests.get(status_url, headers=HEADERS)
+            r = requests.get(status_url, headers=HEADERS, timeout=10)
             if r.status_code == 200:
                 data = r.json().get("data", {})
                 status = data.get("status")
 
-                if status == "reported":
-                    print(" Xong! Đang tải JSON...")
-                    # Tải báo cáo
-                    rep = requests.get(report_url, headers=HEADERS)
-                    return rep.json()
-                elif status == "failed_analysis":
-                    print(" Thất bại (Analysis Failed)!")
-                    return None
-                elif status == "error":
-                    print(" Lỗi hệ thống CAPE!")
-                    return None
+                if status in ["reported", "failed_analysis", "timeout", "completed"]:
+                    # Tải Report
+                    rep_req = requests.get(report_url, headers=HEADERS, timeout=60)
+                    if rep_req.status_code == 200:
+                        report_data = rep_req.json()
 
-            # Đợi 10s rồi check lại
+                        # --- [LOGIC QUAN TRỌNG CỦA BẠN] ---
+                        # Nếu server báo đang phân tích dở (error: true) -> Đợi tiếp
+                        if report_data.get("error") is True:
+                            time.sleep(5)
+                            print(" (Wait JSON gen...)", end="")
+                            continue
+
+                        # Check sơ bộ dữ liệu
+                        if (
+                            "target" in report_data
+                            or "behavior" in report_data
+                            or "static" in report_data
+                        ):
+                            print(" OK!")
+                            return report_data
+
             time.sleep(10)
-        except Exception as e:
-            print(f" [!] Lỗi polling: {e}")
+            if i % 6 == 0:
+                print(".", end="", flush=True)
+
+        except requests.exceptions.RequestException:
+            print("x", end="", flush=True)
+            time.sleep(10)
+        except Exception:
             pass
 
-    print(" Timeout (Quá thời gian chờ)!")
-    return None
+    print(" Timeout! Thử tải lần cuối...")
+    try:
+        return requests.get(report_url, headers=HEADERS, timeout=60).json()
+    except:
+        return {}
 
 
-def extract_features(report):
-    """
-    Trích xuất: API Calls (All), Imports (1000), Sections (All)
-    """
+def delete_task(task_id):
+    """Xóa task trên CAPE để giải phóng ổ cứng"""
+    url = f"{CAPE_HOST}/apiv2/tasks/delete/{task_id}/"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            return True  # Xóa thành công
+        elif r.status_code == 404:
+            return True  # Đã xóa từ trước
+        return False
+    except:
+        return False
+
+
+def extract_features_raw(report):
+    """Sử dụng logic trích xuất chuẩn của bạn"""
     features = {"api": [], "imports": [], "sections": []}
-
     if not report:
+        print(" [!] Report rỗng!")
         return features
 
-    # 1. Trích xuất API Calls (Behavior)
-    # Lấy process có nhiều hành vi nhất
+    # 1. API Calls (Lấy TOÀN BỘ)
     try:
         processes = report.get("behavior", {}).get("processes", [])
-        if processes:
-            # Tìm process có số lượng call lớn nhất
-            best_proc = max(processes, key=lambda x: len(x.get("calls", [])))
+        all_calls = []
+        for proc in processes:
+            # CAPEv2 cấu trúc call có thể là dict hoặc list
+            for call in proc.get("calls", []):
+                if isinstance(call, dict) and call.get("api"):
+                    all_calls.append(call["api"])
+        features["api"] = all_calls
+    except Exception as e:
+        print(f" [!] Lỗi API: {e}")
 
-            # Lấy list tên API
-            calls = best_proc.get("calls", [])
-            features["api"] = [c.get("api") for c in calls if c.get("api")]
-    except Exception:
-        pass
-
-    # 2. Trích xuất Static Info (Imports & Sections)
+    # 2. Static Info (Imports & Sections)
     try:
-        pe = report.get("static", {}).get("pe", {})
+        # Ưu tiên lấy từ target > static > pe
+        target_pe = report.get("target", {}).get("file", {}).get("pe", {})
+        static_pe = report.get("static", {}).get("pe", {})
+        pe_node = target_pe if target_pe else static_pe
 
-        # Sections: Lấy hết
-        features["sections"] = pe.get("sections", [])
+        # Imports
+        raw_imports = pe_node.get("imports", [])
+        flat_imp = []
+        if isinstance(raw_imports, dict):  # Format mới
+            for d in raw_imports.values():
+                for f in d.get("imports", []):
+                    if f.get("name"):
+                        flat_imp.append(f["name"])
+        elif isinstance(raw_imports, list):  # Format cũ
+            for d in raw_imports:
+                for f in d.get("imports", []):
+                    if f.get("name"):
+                        flat_imp.append(f["name"])
+        features["imports"] = flat_imp[:1000]
 
-        # Imports: Lấy tên hàm, giới hạn 1000
-        imports_list = []
-        for dll in pe.get("imports", []):
-            for func in dll.get("imports", []):
-                if func.get("name"):
-                    imports_list.append(func["name"])
-        features["imports"] = imports_list[:1000]
-
-    except Exception:
-        pass
+        # Sections
+        features["sections"] = pe_node.get("sections", [])
+    except Exception as e:
+        print(f" [!] Lỗi Static: {e}")
 
     return features
 
 
+# ==============================================================================
+# 3. MAIN LOOP (FULL OPTION)
+# ==============================================================================
+
+
 def main():
-    # Mảng lưu dữ liệu
-    all_names = []
-    all_labels = []
-    all_apis = []
-    all_imports = []
-    all_sections = []
+    ensure_workspace()
 
-    print(f"--- BẮT ĐẦU QUÉT TRÊN SERVER {CAPE_HOST} ---")
+    processed_set = load_processed_set()
+    print(f"--- Đã hoàn thành {len(processed_set)} file trước đó (Skip) ---")
 
-    for root, dirs, files in os.walk(ROOT_DIR):
-        for filename in files:
-            # Bỏ qua file ẩn
-            if filename.startswith("."):
-                continue
+    current_batch = {
+        "name": [],
+        "label": [],
+        "api": [],
+        "pe_imports": [],
+        "pe_sections": [],
+    }
 
-            file_path = os.path.join(root, filename)
-            label = os.path.basename(root)
+    try:
+        for root, dirs, files in os.walk(ROOT_DIR):
+            for filename in files:
+                if filename.startswith("."):
+                    continue
+                if filename in processed_set:
+                    continue
 
-            print(f"\n>>> Xử lý: {filename} (Label: {label})")
+                file_path = os.path.join(root, filename)
+                label = os.path.basename(root)
+                print(f"\n>>> File: {filename} | Label: {label}")
 
-            # 1. Submit
-            tid = submit_to_cape(file_path)
-            if not tid:
-                continue
+                start_time = time.time()
 
-            # 2. Đợi kết quả
-            report = wait_for_report(tid)
-            if not report:
-                continue
+                # 1. Submit
+                tid = submit_to_cape(file_path)
+                if not tid:
+                    continue
 
-            # 3. Trích xuất
-            feats = extract_features(report)
+                # 2. Wait Report (Với logic fix lỗi của bạn)
+                report = wait_for_report(tid)
 
-            # 4. Lưu vào list
-            all_names.append(filename)
-            all_labels.append(label)
-            all_apis.append(np.array(feats["api"]))  # Array of strings
-            all_imports.append(np.array(feats["imports"]))  # Array of strings
-            all_sections.append(feats["sections"])  # List of Dicts
+                # 3. Extract Features
+                feats = extract_features_raw(report)
 
-            print(
-                f" -> Thu được: {len(feats['api'])} APIs, {len(feats['imports'])} Imports"
-            )
+                duration = time.time() - start_time
 
-    # Lưu file .npz
-    print(f"\n--- ĐANG LƯU FILE {OUTPUT_FILE} ---")
-    np.savez_compressed(
-        OUTPUT_FILE,
-        name=np.array(all_names),
-        label=np.array(all_labels),
-        api=np.array(all_apis, dtype=object),
-        pe_imports=np.array(all_imports, dtype=object),
-        pe_sections=np.array(all_sections, dtype=object),
-    )
-    print("HOÀN TẤT!")
+                # 4. In kết quả & Thời gian
+                n_api = len(feats["api"])
+                n_imp = len(feats["imports"])
+                n_sec = len(feats["sections"])
+                print(f"   [RESULT] API: {n_api} | Import: {n_imp} | Section: {n_sec}")
+                print(f"   [TIME]   Hoàn thành trong: {duration:.2f}s")
+
+                # 5. Lưu RAM
+                current_batch["name"].append(filename)
+                current_batch["label"].append(label)
+                current_batch["api"].append(np.array(feats["api"]))
+                current_batch["pe_imports"].append(np.array(feats["imports"]))
+                current_batch["pe_sections"].append(feats["sections"])
+
+                processed_set.add(filename)
+
+                # 6. Xóa Task ngay lập tức
+                delete_task(tid)
+
+                print(f"   [BATCH]  {len(current_batch['name'])}/{BATCH_SIZE}")
+
+                # 7. Lưu xuống đĩa nếu đủ batch
+                if len(current_batch["name"]) >= BATCH_SIZE:
+                    save_batch_npz(current_batch)
+                    current_batch = {
+                        "name": [],
+                        "label": [],
+                        "api": [],
+                        "pe_imports": [],
+                        "pe_sections": [],
+                    }
+
+    except KeyboardInterrupt:
+        print("\n\n [STOP] ĐANG DỪNG BỞI NGƯỜI DÙNG... (Đợi lưu file cuối)")
+    except Exception as e:
+        print(f"\n\n [CRASH] Lỗi: {e}")
+    finally:
+        # --- SAFETY SAVE ---
+        if len(current_batch["name"]) > 0:
+            print(f"\n [SAFETY SAVE] Lưu {len(current_batch['name'])} file cuối...")
+            save_batch_npz(current_batch)
+
+        # Gộp file
+        merge_all_npz()
 
 
 if __name__ == "__main__":
